@@ -1,0 +1,143 @@
+---
+title: "Introduction to BQSR in GATK"
+author: "Xiang GU"
+date: "Friday, March 06, 2015"
+output: 
+  html_document:
+    theme: united
+    highlight: tango
+    mathjax: https://d3eoax9i5htok0.cloudfront.net/mathjax/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML
+    
+---
+#Basic Introduction to Base Quality Score Recalibration in GATK#
+
+## Why Base Quality Score Recalibration? ##
+
+### What Is an Error? ###
+<p>    Base Quality score reflects the confidence of a sequencer on a particular base. That is to say, the base quality score is reflecting the probability that a sequencer makes an error which mis-read a base, such as from true A to false T. This can be mismatches in many reasons, including but not limited to, a ture SNP, chemistry error during the synthesis in sequencing, sequencer capture random noise or systematic biases. If a unique mismatch in the aligned read happens, it may be true unknown SNP but also may be just a machine error. If in the latter case and we called this as a novel SNP, we would encounter a false positive. However, if we simply threw away this one unique mismatch simply because its low frequency (only present once in whole dataset), we might throw away our true signal thus leaving a false negative. </p>
+
+
+### Quality Score###
+
+In order to tell how likely each base is due to machine error or how accurate each base measurement is, the sequencer will assign a quality score to reflect the probability that the sequencer read this base in error. Base quality score is reported on a Phred scale:
+
+$$\ Base Quality Score = -10 \times log_{10}(p) $$
+
+where p is the probability of error.
+For example, a base quality score of 10 on Phred scale means an error rate of 0.1, as shwon below:
+
+```{r echo=FALSE}
+options("scipen" = 10)
+prob2phred <- function(x){return(-log10(x)*10)}
+phred2prob <- function(x){return(10^(-x/10))}
+d1 <- as.data.frame(rbind(QualityScore=round(c(10,20,30,40,50,60),0), 
+                          ErrorProb =phred2prob(c(10,20,30,40,50,60))))
+d1
+```
+
+### Why Adjustment Needed?###
+As mentioned above, this error may be due to a ture SNP, chemistry error during the synthesis in sequencing, sequencer capture random noise or systematic biases. The systematic biases could be machine-, run-, or even sample-specific. While the quality score shown above, usually appeared directly from the raw sequencing result file or in .bam file, is only an estimate from the sequencer, therefore the inaccurate or biased base qualities may result in biased variant calls. If base quality scores are either over-estimated or under-estimated, it may result in false positive or false negative results. Therefore, we need a better model to estimate the true quality of any mismatch.
+
+## Empirical Model ##
+
+There are two models used in the field, one is mainly focused on machine learning algorithm to train a regression model to predict better estimated error rate, the other is using empirical model to train the model to predict, which is widely used and one of them is GATK. We will focus on GATK BQSR method here since it is easier to interpret and implent.
+
+The empirical model developed by GATK will calculate empirically accurate base quality scores for each base in every read while correcting for error covariates like machine cycle and dinucleotide context with input of Read Group and Original Base Quality. The machine cycle here means the base position in a read in Illumina sequencing platform. Dinucleotide context means a scanning window of 3 bases. Newer version of GATK seems considering more complex context such as polymers like AAAAAAAA*** (need confirmation). Read group means generally the lane from which reads were generated. This is to consider that different lanes may have different noise background to model separately (see discussion) and one of the standard workflows in Broad Institute is not multiplexing the samples but only distribute one sample into several lanes to get high pass data to ensure SNP detection and reads coverage. The empirical modeling contains mainly two steps:
+
+### 1. Empirical model training###
+
+For each lane, or each read group, the algorithm first tabulates empirical mismatches to the reference at all loci not known to vary in the population (dbSNP), conditioning the bases by their reported quality score (R), their machine cycle in the read (C) and their dinucleotide context (D). For example, given the read below:
+
+```{r echo=F}
+set.seed(1)
+d2 <- rbind(BasePosition = seq(0,9,1),
+           ReferenceBase = c(rep(c("A","T","C","G"),2),"A","T"),
+           SeqReadResult = c("A","T","A","G","T","T","C","G","T","T"),
+           PhredScore = sample(seq(10,60,10),10,replace = T),
+           in_dbSNP = c(NA, NA, "N", NA, "Y", NA, NA, NA,"N", NA),
+           MarkError = c(NA, NA, "Y", NA, "N", NA, NA, NA,"Y", NA))
+d2 <- as.data.frame(d2)
+d2
+```
+
+As we can see there are three mismatches, at position 2, 4 and 8. By referring to dbSNP database, one of them (position 4) is an already known SNP. Therefore, we only need to mark position 2 and 8 as bases which need calibration, as shown in the row "MarkError" because they were not reported and thus they have higher chance of being machine errors. Here the underlying assumption is that we generally treat all mismatches as they are from errors except those which are already known as variation, such as in dbSNP. This will make sure to avoid true variations being considered as sequencing errors. So in this single read, we identify 2 potential errors as mismatches and totally 10 bases. Of course we can recalculate the empirical quality score for this single read, however, it is meaningless to do such thing. The power of empirical modeling is based on large number of observations on which we can build models to detect potential pattern. Therefore, in this model, we will do the same thing -- referring to dbSNP and mark how many and which bases we need to calibrate -- for each read in each dinucleotide pattern of each machine cycle of each read in each read group (lane) of each sample. So as we can see this modeling will take a long time and large storage space since there are 16 dinucleotide pattern (x:y, 4*4), 50 positions in machine cycle of 50 single end data, maybe 2 to 3 lanes per sample and millions of reads. The processes above can be written as:
+
+$$\ mismatches(R;C;D) = \sum_{r \in R}\sum_{c \in C}\sum_{d \in D} b_{r,c,d} \neq b_{ref}\tag{1} $$
+
+$$\ bases(R;C;D) = \sum_{r \in R}\sum_{c \in C}\sum_{d \in D} | b_{r,c,d} |\tag{2}$$
+
+where R, C, D means read group, machine cycle and dinucleotide pattern, b is used to denote the base call, and ref is used to denote the reference base. First equation sums up all the mismatches found in a particular condition, i.e. defined read group, machine cycle and dinucleotide pattern. While the second equation sums up all the bases in this defined condition. With this two number we can calculate the empirical base quality scores which is just the ratio between mismatches and total bases adjusted by a coefficient, corrected using Yates correction, shown as below. Yates correction is done to avoid divide by 0 cases or small size case where total number of bases is 2 and mismatch is 1 which would give you highly biased result.
+
+$$\ Qempirical(R;C;D) = -10 \times log_{10}({mismatches(R;C;D) + 1 \over bases(R;C;D) + 2})\tag{3}\label{3}$$
+
+So as you can imagine, we have totally million of reads for one sample, we then categorize them firstly into several read groups (lane), and then tabulate each base at its position in the read, known as machine cycle, and finally further tabulate by dinucleotide pattern or more complex nucleotide context. So we expect to get a table looking like this one below (example revised from GATK Website: www.broadinstitute.org/gatk/guide/best-practices?bpm=DNAseq#methods_bqsr44):
+
+```{r echo=FALSE}
+ex_rg <- read.delim("./example_readgroup.txt")
+ex_rg
+```
+
+GATK BQSR works with different mutation types as shown in the table above under column "Type". Based on the total observations and errors after excluding those known in database, we can calculate the empirical quality score for each read group, as shown in the last column.
+
+Let's imagine a simple example where in a particular condition with defined read group, machine cycle and nucleotide context, we only get one read, for example, the one read shown above, represented here:
+
+```{r echo=F}
+d2
+```
+
+Here we have mismatches of 2 and observation of 10. So the empirical quality score calculated by the way above is ```r prob2phred(3/11)```. While the original phred score from sequencer tells us the aggregate error probability of this read with 10 bases is: $\ (0.00001 + 0.01 + 0.1 + 0.001 + 0.001 + 0.01 + 0.1 + 0.1 + 0.000001 + 0.0001)/10 = 0.0322111 $. So the corresponding Quality Score is $\ 14.91994\approx 15$.
+
+Running BQSR on a single read is useless and inaccurate but running BQSR across millions of reads in a file allows for very accurate recalibrations. Let's look at more realistic but simplified example. In image below, we have one sample called Sample A, which was splitted onto two lanes for sequencing. So we can easily separate the reads by their Read Group ID, which is into Read Group 1 and Read Group 2. In this sample there are many mismatches not covered in databases and we pick them out. In each blue box, the number on the first line indicates the ratio between mismatched bases and total bases. In this sample, we totally observed 125 mismatches not covered in databases among totally 20k bases, which is a very small number compared to real data, but we just used these numbers as an example to show how the algorithm works. Then in each read group (RG), we train the model separately because our assumption is that different lanes and different samples have different noise background to estimate. For instance, in RG1 with 75 errors in 11k bases, these 75 errors have two kinds of reported Quality Scores (QS), one is 23 and the other is 24. In this step of simple example, we just simply divide them to two groups (red and yellow boxes) based on this reported QS. In real data, we will also consider the machine cycle and dinucleotide context which can further separate the errors into finer groups. Similarly, we will separate the mismatches in RG2 into two groups (green and purple boxes) because the mismatches have only two levels of reported QS in this simplified example.
+
+![](readQS1.png)
+
+Now, after building up this tree like categorical structure, we will work from bottom to up in calculating the empirical QS using the equation $\eqref{3}$ and fill in the Emp QS blanks in the figure above. So we can calculate the empirical QS for each of the boxes based on the number of errors and total observations in the reads where we find each error. For example, in the red box, we have 30 errors and 5k observations. Applying equation $\eqref{3}$ we will get 22.08 as empirical QS. We will do the same thing for each of the boxes and get a figure looking like this one below.
+
+![](readQS2.png)
+
+In this way we finish calculating the empirical scores based on the read group and reported QS. Remember we will also include machine cycle and other covariables when handling the real data. By then we will get some data looking like this one below (example revised from GATK Website: www.broadinstitute.org/gatk/guide/best-practices?bpm=DNAseq#methods_bqsr44):
+
+```{r echo=FALSE}
+read.delim("./example_covariable.txt")
+```
+
+For example the table above categorize the reads even further by nucleotide context. We will also have other covariate tables for machine cycles or you could merge them as one with more columns annoting different covariates. This result table is called recalibration table. The next step is to calculate the adjusted QS based on all the covariates considered and estimated in the step above.
+
+### 2. Recalibrate base quality scores ###
+
+With the recalibration table built in last step, quality score can be recalibrated using the equation below:
+
+$$\ recal(r; c; d) = reportGlobal + \Delta Sample + \Delta readgroup + \Delta quality + \sum \Delta covariates \tag{4}\label{4} $$
+
+The left side of equation above is the quality score of one mismatch when specifying the read group (r), machine cycle (c) and nucleotide context (d). On the right, the first term is the reported Global QS from the machine. The second is the difference in QS in this specific samples, summing up all the read groups. The third is the read group specific difference. The fourth is the quality specific difference. The last will sum up the covariate specific difference in all covariates. The flexibility of this equation is that it allows you to input more covariates not limited to these three covariates but also other terms you are interested in. For example, if you want to compare two different library prep methods or you want to compare two sources of samples. Below we will use a simplified example to show quickly how you use this equation.
+
+![](co.png)
+
+For example, we still use the simplified case above where we have Sample A splitted onto two lanes and two subcategories based on reported quality in each read group. Let's use the red box with 30 errors and reported QS of 25 as an example. We look at these 30 mismatches and subdivide them based on the machine cycle, i.e. the position of the mismatch in a read. In the downside table we can see, there are one mismatch at the beginning of the reads and several other mismatches at other positions. These mismatches could be subdivided based on nucleotide context. Let's use this mismatch at the beginning as an example and we do not examine the nucleotide context to simplify the case as in this example. We can calculate its empirical QS by equation $\eqref{3}$ and it is 21.79. 
+
+So the first term in the equation $\eqref{4}$ is 24 for this sample. The Sample specific difference is $\ -2 = 22 -24 $. The read group specific difference is $\ - 1.4 = 21.60 - 23 $. The quality group specific difference is $\ -0.92 = 22.08 - 23 $. Here we have only one covariate, the machine cycle, so $\Delta machine cycle$ will be -1.21 = 21.79 -23. So we apply all these numbers to the equation $\eqref{4}$ will get the result of recalibrated quality score for this specific mismatch as: $\ recal(r; c; d) = 18.47 = 24 -  2 - 1.4 - 0.92 - 1.21 $ while its reported quality score is 23.
+
+After applying this scheme for all the mismatches, we finish the base quality score recalibration.
+
+## Note ##
+
+### Hadoop Application###
+
+Reported as on Mar 5th 2015 on GATK website and official forum, current version do not support Hadoop. The Broad Institute has not yet fully tested it on Hadoop so they can not provide support on this. One thing important in applying Hadoop is to carefully split or map the original data to nodes. As in the equation $\eqref{3}$ in calculating the empirical QS, we will take consideration with all the observations in one sample. Careless mapping could result in errors in calculating empirical QS.
+
+### Covariates ###
+
+Many other covariates can be applied in the equation $\eqref{4}$ but be careful in doing so and with justification.
+
+### Read Group ###
+
+The read group ID should be unique. In the case that one lane is multiplexed with many samples, these many samples should not share the same read group ID although they are from the same lane, but their noise background could be different.
+
+## Reference ##
+
+Some of the examples shown in this article are revised from the examples in GATK website (www.broadinstitute.org/gatk/guide/best-practices?bpm=DNAseq#methods_bqsr44) and a tutorial on Zen Fractal Blog (zenfractal.com/). The original publication of GATK is: Mark A DePristo, et al., <b>A framework for variation discovery and genotyping using next-generation DNA sequencing data</b>. 2011. Nature Genetics. VOLUME 43:491. doi:10.1038/ng.806
+
+## Contact ##
+
+I hope you have found such a quick introduction helpful. There could be some mistakes and in case of conflict please refer to the official GATK document. Please leave comments and suggestions or if you have question, or find errors, to gumilton AT gmail DOT com.
+
